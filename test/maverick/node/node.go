@@ -5,13 +5,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/dashevo/dashd-go/btcjson"
 	"net"
 	"net/http"
 	_ "net/http/pprof" // nolint: gosec // securely exposed on separate, optional port
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/dashevo/dashd-go/btcjson"
+	dashcore "github.com/tendermint/tendermint/dashcore/rpc"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -31,7 +33,6 @@ import (
 	"github.com/tendermint/tendermint/libs/log"
 	tmpubsub "github.com/tendermint/tendermint/libs/pubsub"
 	"github.com/tendermint/tendermint/libs/service"
-	"github.com/tendermint/tendermint/light"
 	mempl "github.com/tendermint/tendermint/mempool"
 	"github.com/tendermint/tendermint/p2p"
 	"github.com/tendermint/tendermint/p2p/pex"
@@ -129,12 +130,12 @@ func DefaultNewNode(config *cfg.Config, logger log.Logger, misbehaviors map[int6
 	}
 
 	return NewNode(config,
-		LoadOrGenFilePV(config.PrivValidatorKeyFile(), config.PrivValidatorStateFile()),
 		nodeKey,
 		proxy.DefaultClientCreator(config.ProxyApp, config.ABCI, config.DBDir()),
 		DefaultGenesisDocProviderFunc(config),
 		DefaultDBProvider,
 		DefaultMetricsProvider(config.Instrumentation),
+		nil,
 		logger,
 		misbehaviors,
 	)
@@ -156,6 +157,15 @@ func DefaultMetricsProvider(config *cfg.InstrumentationConfig) MetricsProvider {
 		}
 		return consensus.NopMetrics(), p2p.NopMetrics(), mempl.NopMetrics(), sm.NopMetrics()
 	}
+}
+
+// DefaultDashCoreRpcClient returns RPC client for the Dash Core node
+func DefaultDashCoreRpcClient(config *cfg.Config) (dashcore.DashCoreClient, error) {
+	return dashcore.NewDashCoreRpcClient(
+		config.PrivValidatorCoreRPCHost,
+		config.BaseConfig.PrivValidatorCoreRPCUsername,
+		config.BaseConfig.PrivValidatorCoreRPCPassword,
+	)
 }
 
 // Option sets a parameter for the node.
@@ -255,6 +265,8 @@ type Node struct {
 	blockIndexer      indexer.BlockIndexer
 	indexerService    *txindex.IndexerService
 	prometheusSrv     *http.Server
+
+	dashCoreRpcClient dashcore.DashCoreClient
 }
 
 func initDBs(config *cfg.Config, dbProvider DBProvider) (blockStore *store.BlockStore, stateDB dbm.DB, err error) {
@@ -327,25 +339,7 @@ func createAndStartIndexerService(
 	return indexerService, txIndexer, blockIndexer, nil
 }
 
-func doHandshake(
-	stateStore sm.Store,
-	state sm.State,
-	blockStore sm.BlockStore,
-	genDoc *types.GenesisDoc,
-	eventBus types.BlockEventPublisher,
-	proxyApp proxy.AppConns,
-	consensusLogger log.Logger) error {
-
-	handshaker := cs.NewHandshaker(stateStore, state, blockStore, genDoc)
-	handshaker.SetLogger(consensusLogger)
-	handshaker.SetEventBus(eventBus)
-	if err := handshaker.Handshake(proxyApp); err != nil {
-		return fmt.Errorf("error during handshake: %v", err)
-	}
-	return nil
-}
-
-func logNodeStartupInfo(state sm.State, proTxHash crypto.ProTxHash, logger, consensusLogger log.Logger) {
+func logNodeStartupInfo(state sm.State, proTxHash *crypto.ProTxHash, logger, consensusLogger log.Logger) {
 	// Log the version info.
 	logger.Info("Version info",
 		"software", version.TMCoreSemVer,
@@ -362,19 +356,22 @@ func logNodeStartupInfo(state sm.State, proTxHash crypto.ProTxHash, logger, cons
 	}
 
 	// Log whether this node is a validator or an observer
-	if state.Validators.HasProTxHash(proTxHash) {
+	if proTxHash != nil && state.Validators.HasProTxHash(*proTxHash) {
 		consensusLogger.Info("This node is a validator", "proTxHash", proTxHash)
 	} else {
 		consensusLogger.Info("This node is not a validator", "proTxHash", proTxHash)
 	}
 }
 
-func onlyValidatorIsUs(state sm.State, proTxHash types.ProTxHash) bool {
+func onlyValidatorIsUs(state sm.State, proTxHash *types.ProTxHash) bool {
+	if proTxHash == nil {
+		return false
+	}
 	if state.Validators.Size() > 1 {
 		return false
 	}
 	validatorProTxHash, _ := state.Validators.GetByIndex(0)
-	return bytes.Equal(validatorProTxHash, proTxHash)
+	return bytes.Equal(validatorProTxHash, *proTxHash)
 }
 
 func createMempoolAndMempoolReactor(config *cfg.Config, proxyApp proxy.AppConns,
@@ -419,16 +416,17 @@ func createBlockchainReactor(config *cfg.Config,
 	state sm.State,
 	blockExec *sm.BlockExecutor,
 	blockStore *store.BlockStore,
+	nodeProTxHash *crypto.ProTxHash,
 	fastSync bool,
 	logger log.Logger) (bcReactor p2p.Reactor, err error) {
 
 	switch config.FastSync.Version {
 	case "v0":
-		bcReactor = bcv0.NewBlockchainReactor(state.Copy(), blockExec, blockStore, fastSync)
+		bcReactor = bcv0.NewBlockchainReactor(state.Copy(), blockExec, blockStore, nodeProTxHash, fastSync)
 	case "v1":
-		bcReactor = bcv1.NewBlockchainReactor(state.Copy(), blockExec, blockStore, fastSync)
+		bcReactor = bcv1.NewBlockchainReactor(state.Copy(), blockExec, blockStore, nodeProTxHash, fastSync)
 	case "v2":
-		bcReactor = bcv2.NewBlockchainReactor(state.Copy(), blockExec, blockStore, fastSync)
+		bcReactor = bcv2.NewBlockchainReactor(state.Copy(), blockExec, blockStore, nodeProTxHash, fastSync)
 	default:
 		return nil, fmt.Errorf("unknown fastsync version %s", config.FastSync.Version)
 	}
@@ -625,7 +623,7 @@ func createPEXReactorAndAddToSwitch(addrBook pex.AddrBook, config *cfg.Config,
 // startStateSync starts an asynchronous state sync process, then switches to fast sync mode.
 func startStateSync(ssR *statesync.Reactor, bcR fastSyncReactor, conR *cs.Reactor,
 	stateProvider statesync.StateProvider, config *cfg.StateSyncConfig, fastSync bool,
-	stateStore sm.Store, blockStore *store.BlockStore, state sm.State) error {
+	stateStore sm.Store, blockStore *store.BlockStore, state sm.State, dashCoreRpcClient dashcore.DashCoreClient) error {
 	ssR.Logger.Info("Starting state sync")
 
 	if stateProvider == nil {
@@ -634,12 +632,13 @@ func startStateSync(ssR *statesync.Reactor, bcR fastSyncReactor, conR *cs.Reacto
 		defer cancel()
 		stateProvider, err = statesync.NewLightClientStateProvider(
 			ctx,
-			state.ChainID, state.Version, state.InitialHeight,
-			config.RPCServers, light.TrustOptions{
-				Period: config.TrustPeriod,
-				Height: config.TrustHeight,
-				Hash:   config.TrustHashBytes(),
-			}, ssR.Logger.With("module", "light"))
+			state.ChainID,
+			state.Version,
+			state.InitialHeight,
+			config.RPCServers,
+			dashCoreRpcClient,
+			ssR.Logger.With("module", "light"),
+		)
 		if err != nil {
 			return fmt.Errorf("failed to set up light client state provider: %w", err)
 		}
@@ -680,12 +679,12 @@ func startStateSync(ssR *statesync.Reactor, bcR fastSyncReactor, conR *cs.Reacto
 
 // NewNode returns a new, ready to go, Tendermint Node.
 func NewNode(config *cfg.Config,
-	privValidator types.PrivValidator,
 	nodeKey *p2p.NodeKey,
 	clientCreator proxy.ClientCreator,
 	genesisDocProvider GenesisDocProvider,
 	dbProvider DBProvider,
 	metricsProvider MetricsProvider,
+	dashCoreRpcClient dashcore.DashCoreClient,
 	logger log.Logger,
 	misbehaviors map[int64]cs.Misbehavior,
 	options ...Option) (*Node, error) {
@@ -722,29 +721,77 @@ func NewNode(config *cfg.Config,
 		return nil, err
 	}
 
-	useDashCoreSigning := false
 	var weAreOnlyValidator bool
-	var proTxHash crypto.ProTxHash
+	var proTxHashP *crypto.ProTxHash
+	var privValidator types.PrivValidator
 	if config.PrivValidatorCoreRPCHost != "" {
-		useDashCoreSigning = true
-		weAreOnlyValidator = false
-	} else {
-		if config.PrivValidatorListenAddr != "" {
-			// If an address is provided, listen on the socket for a connection from an
-			// external signing process.
-			// FIXME: we should start services inside OnStart
-			privValidator, err = createAndStartPrivValidatorSocketClient(config.PrivValidatorListenAddr, genDoc.ChainID, genDoc.QuorumHash, logger)
+		logger.Info("Initializing Dash Core Signing", "quorum hash", state.Validators.QuorumHash.String())
+		llmqType := config.Consensus.QuorumType
+		if llmqType == 0 {
+			llmqType = btcjson.LLMQType_100_67
+		}
+		if dashCoreRpcClient == nil {
+			rpcClient, err := DefaultDashCoreRpcClient(config)
 			if err != nil {
-				return nil, fmt.Errorf("error with private validator socket client: %w", err)
+				return nil, fmt.Errorf("failed to create Dash Core RPC client %w", err)
 			}
+			dashCoreRpcClient = rpcClient
+		}
 
-		}
-		proTxHash, err = privValidator.GetProTxHash()
+		// If a local port is provided for Dash Core rpc into the service to sign.
+		privValidator, err = createAndStartPrivValidatorRPCClient(config.Consensus.QuorumType, dashCoreRpcClient, logger)
 		if err != nil {
-			return nil, fmt.Errorf("can't get proTxHash: %w", err)
+			return nil, fmt.Errorf("error with private validator socket client: %w", err)
 		}
-		weAreOnlyValidator = onlyValidatorIsUs(state, proTxHash)
+		if config.IsMasternode {
+			proTxHash, err := privValidator.GetProTxHash()
+			if err != nil {
+				return nil, fmt.Errorf("can't get proTxHash using dash core signing: %w", err)
+			}
+			proTxHashP = &proTxHash
+			logger.Info("Connected to Core RPC Masternode", "proTxHash", proTxHash.String())
+		} else {
+			logger.Info("Connected to Core RPC FullNode")
+		}
+	} else if config.PrivValidatorListenAddr != "" {
+		// If an address is provided, listen on the socket for a connection from an
+		// external signing process.
+		// FIXME: we should start services inside OnStart
+		privValidator, err = createAndStartPrivValidatorSocketClient(config.PrivValidatorListenAddr, genDoc.ChainID, genDoc.QuorumHash, logger)
+		if err != nil {
+			return nil, fmt.Errorf("error with private validator socket client: %w", err)
+		}
+		if config.IsMasternode {
+			proTxHash, err := privValidator.GetProTxHash()
+			if err != nil {
+				return nil, fmt.Errorf("can't get proTxHash using dash core signing: %w", err)
+			}
+			proTxHashP = &proTxHash
+			logger.Info("Connected to Private Validator through listen address", "proTxHash", proTxHash.String())
+		} else {
+			logger.Info("Connected to Private Validator through listen address")
+		}
+	} else {
+		privValidator = privval.LoadOrGenFilePV(config.PrivValidatorKeyFile(), config.PrivValidatorStateFile())
+		proTxHash, err := privValidator.GetProTxHash()
+		if err != nil {
+			return nil, fmt.Errorf("can't get proTxHash through file: %w", err)
+		}
+		proTxHashP = &proTxHash
+		logger.Info("Private Validator using local file", "proTxHash", proTxHash.String())
 	}
+
+	if dashCoreRpcClient == nil {
+		llmqType := config.Consensus.QuorumType
+		if llmqType == 0 {
+			llmqType = btcjson.LLMQType_100_67
+		}
+		// This is used for light client verification only
+		mockClient := dashcore.NewDashCoreMockClient(config.ChainID(), llmqType, privValidator, false)
+		dashCoreRpcClient = mockClient
+	}
+
+	weAreOnlyValidator = onlyValidatorIsUs(state, proTxHashP)
 
 	// Determine whether we should attempt state sync.
 	stateSync := config.StateSync.Enable && !weAreOnlyValidator
@@ -757,8 +804,11 @@ func NewNode(config *cfg.Config,
 	// and replays any blocks as necessary to sync tendermint with the app.
 	consensusLogger := logger.With("module", "consensus")
 	if !stateSync {
-		if err := doHandshake(stateStore, state, blockStore, genDoc, eventBus, proxyApp, consensusLogger); err != nil {
-			return nil, err
+		handshaker := cs.NewHandshaker(stateStore, state, blockStore, genDoc, proTxHashP, config.Consensus.AppHashSize)
+		handshaker.SetLogger(consensusLogger)
+		handshaker.SetEventBus(eventBus)
+		if err := handshaker.Handshake(proxyApp); err != nil {
+			return nil, fmt.Errorf("error during handshake: %v", err)
 		}
 
 		// Reload the state. It will have the Version.Consensus.App set by the
@@ -770,41 +820,24 @@ func NewNode(config *cfg.Config,
 		}
 	}
 
-	// This needs to be done after init chain so we can get the first quorum hash
-	if useDashCoreSigning {
-		logger.Info("Initializing Dash Core Signing", "quorum hash", state.Validators.QuorumHash.String())
-		username := config.BaseConfig.PrivValidatorCoreRPCUsername
-		password := config.BaseConfig.PrivValidatorCoreRPCPassword
-		llmqType := config.Consensus.QuorumType
-		if llmqType == 0 {
-			llmqType = btcjson.LLMQType_100_67
-		}
-		// If a local port is provided for Dash Core rpc into the service to sign.
-		privValidator, err = createAndStartPrivValidatorRPCClient(config.PrivValidatorCoreRPCHost, genDoc.ChainID,
-			state.Validators.QuorumHash, llmqType, username, password, logger)
-		if err != nil {
-			return nil, fmt.Errorf("error with private validator socket client: %w", err)
-		}
-		proTxHash, err = privValidator.GetProTxHash()
-		if err != nil {
-			return nil, fmt.Errorf("can't get proTxHash using dash core signing: %w", err)
-		}
-		weAreOnlyValidator = onlyValidatorIsUs(state, proTxHash)
-	}
-
 	// Determine whether we should do fast sync. This must happen after the handshake, since the
 	// app may modify the validator set, specifying ourself as the only validator.
 	fastSync := config.FastSyncMode && !weAreOnlyValidator
 
-	logNodeStartupInfo(state, proTxHash, logger, consensusLogger)
+	logNodeStartupInfo(state, proTxHashP, logger, consensusLogger)
 
 	csMetrics, p2pMetrics, memplMetrics, smMetrics := metricsProvider(genDoc.ChainID)
 
-	// Make MempoolReactor
+	// Make Mempool Reactor
 	mempoolReactor, mempool := createMempoolAndMempoolReactor(config, proxyApp, state, memplMetrics, logger)
 
 	// Make Evidence Reactor
 	evidenceReactor, evidencePool, err := createEvidenceReactor(config, dbProvider, stateDB, blockStore, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	nextCoreChainLock, err := types.CoreChainLockFromProto(genDoc.InitialProposalCoreChainLock)
 	if err != nil {
 		return nil, err
 	}
@@ -817,13 +850,13 @@ func NewNode(config *cfg.Config,
 		proxyApp.Query(),
 		mempool,
 		evidencePool,
-		nil,
+		nextCoreChainLock,
 		sm.BlockExecutorWithMetrics(smMetrics),
 		sm.BlockExecutorWithAppHashSize(config.Consensus.AppHashSize),
 	)
 
 	// Make BlockchainReactor. Don't start fast sync if we're doing a state sync first.
-	bcReactor, err := createBlockchainReactor(config, state, blockExec, blockStore, fastSync && !stateSync, logger)
+	bcReactor, err := createBlockchainReactor(config, state, blockExec, blockStore, proTxHashP, fastSync && !stateSync, logger)
 	if err != nil {
 		return nil, fmt.Errorf("could not create blockchain reactor: %w", err)
 	}
@@ -835,21 +868,24 @@ func NewNode(config *cfg.Config,
 	} else if fastSync {
 		csMetrics.FastSyncing.Set(1)
 	}
-
-	logger.Info("Setting up maverick consensus reactor", "Misbehaviors", misbehaviors)
 	consensusReactor, consensusState := createConsensusReactor(
 		config, state, blockExec, blockStore, mempool, evidencePool,
-		privValidator, csMetrics, stateSync || fastSync, eventBus, consensusLogger, misbehaviors)
+		privValidator, csMetrics, stateSync || fastSync, eventBus, consensusLogger, misbehaviors,
+	)
 
 	// Set up state sync reactor, and schedule a sync if requested.
 	// FIXME The way we do phased startups (e.g. replay -> fast sync -> consensus) is very messy,
 	// we should clean this whole thing up. See:
 	// https://github.com/tendermint/tendermint/issues/4644
-	stateSyncReactor := statesync.NewReactor(proxyApp.Snapshot(), proxyApp.Query(),
-		config.StateSync.TempDir)
+	stateSyncReactor := statesync.NewReactor(
+		*config.StateSync,
+		proxyApp.Snapshot(),
+		proxyApp.Query(),
+		config.StateSync.TempDir,
+	)
 	stateSyncReactor.SetLogger(logger.With("module", "statesync"))
 
-	nodeInfo, err := makeNodeInfo(config, nodeKey, txIndexer, genDoc, state)
+	nodeInfo, err := makeNodeInfo(config, nodeKey, txIndexer, genDoc, state, proTxHashP)
 	if err != nil {
 		return nil, err
 	}
@@ -931,6 +967,8 @@ func NewNode(config *cfg.Config,
 		indexerService:   indexerService,
 		blockIndexer:     blockIndexer,
 		eventBus:         eventBus,
+
+		dashCoreRpcClient: dashCoreRpcClient,
 	}
 	node.BaseService = *service.NewBaseService(logger, "Node", node)
 
@@ -1005,7 +1043,8 @@ func (n *Node) OnStart() error {
 			return fmt.Errorf("this blockchain reactor does not support switching from state sync")
 		}
 		err := startStateSync(n.stateSyncReactor, bcR, n.consensusReactor, n.stateSyncProvider,
-			n.config.StateSync, n.config.FastSyncMode, n.stateStore, n.blockStore, n.stateSyncGenesis)
+			n.config.StateSync, n.config.FastSyncMode, n.stateStore, n.blockStore, n.stateSyncGenesis,
+			n.dashCoreRpcClient)
 		if err != nil {
 			return fmt.Errorf("failed to start state sync: %w", err)
 		}
@@ -1068,11 +1107,7 @@ func (n *Node) OnStop() {
 
 // ConfigureRPC makes sure RPC has all the objects it needs to operate.
 func (n *Node) ConfigureRPC() error {
-	proTxHash, err := n.privValidator.GetProTxHash()
-	if err != nil {
-		return fmt.Errorf("can't get proTxHash when meverick configuring nodes for rpc : %w", err)
-	}
-	rpccore.SetEnvironment(&rpccore.Environment{
+	env := rpccore.Environment{
 		ProxyAppQuery:   n.proxyApp.Query(),
 		ProxyAppMempool: n.proxyApp.Mempool(),
 
@@ -1083,7 +1118,6 @@ func (n *Node) ConfigureRPC() error {
 		P2PPeers:       n.sw,
 		P2PTransport:   n,
 
-		ProTxHash:        proTxHash,
 		GenDoc:           n.genesisDoc,
 		TxIndexer:        n.txIndexer,
 		BlockIndexer:     n.blockIndexer,
@@ -1094,7 +1128,17 @@ func (n *Node) ConfigureRPC() error {
 		Logger: n.Logger.With("module", "rpc"),
 
 		Config: *n.config.RPC,
-	})
+	}
+
+	if n.IsConfiguredAsMasternode() {
+		proTxHash, err := n.privValidator.GetProTxHash()
+		if err != nil {
+			return fmt.Errorf("can't get proTxHash for rpc: %w", err)
+		}
+		env.ProTxHash = &proTxHash
+	}
+
+	rpccore.SetEnvironment(&env)
 	return nil
 }
 
@@ -1313,6 +1357,10 @@ func (n *Node) IsListening() bool {
 	return n.isListening
 }
 
+func (n *Node) IsConfiguredAsMasternode() bool {
+	return n.config.IsMasternode
+}
+
 // NodeInfo returns the Node's Info from the Switch.
 func (n *Node) NodeInfo() p2p.NodeInfo {
 	return n.nodeInfo
@@ -1324,6 +1372,7 @@ func makeNodeInfo(
 	txIndexer txindex.TxIndexer,
 	genDoc *types.GenesisDoc,
 	state sm.State,
+	nodeProTxHash *crypto.ProTxHash,
 ) (p2p.NodeInfo, error) {
 	txIndexerStatus := "on"
 	if _, ok := txIndexer.(*null.TxIndex); ok {
@@ -1343,6 +1392,7 @@ func makeNodeInfo(
 	}
 
 	nodeInfo := p2p.DefaultNodeInfo{
+		ProTxHash: nodeProTxHash,
 		ProtocolVersion: p2p.NewProtocolVersion(
 			version.P2PProtocol, // global
 			state.Version.Consensus.Block,
@@ -1474,24 +1524,19 @@ func createAndStartPrivValidatorSocketClient(
 }
 
 func createAndStartPrivValidatorRPCClient(
-	host string,
-	chainID string,
-	initialQuorumHash crypto.QuorumHash,
 	defaultQuorumType btcjson.LLMQType,
-	username string,
-	password string,
+	dashCoreRpcClient dashcore.DashCoreClient,
 	logger log.Logger,
 ) (types.PrivValidator, error) {
-
-	pvsc, err := privval.NewDashCoreSignerClient(host, username, password, defaultQuorumType, chainID)
+	pvsc, err := privval.NewDashCoreSignerClient(dashCoreRpcClient, defaultQuorumType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start private validator: %w", err)
 	}
 
-	// try to get a pubkey from private validate first time
-	_, err = pvsc.GetPubKey(initialQuorumHash)
+	// try to get a proTxHash from private validate first time to make sure connection works
+	_, err = pvsc.GetProTxHash()
 	if err != nil {
-		return nil, fmt.Errorf("can't get pubkey when starting maverick private validator rpc client: %w", err)
+		return nil, fmt.Errorf("can't get proTxHash when starting private validator rpc client: %w", err)
 	}
 
 	//const (

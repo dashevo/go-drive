@@ -3,11 +3,12 @@ package internal
 import (
 	"bytes"
 	"fmt"
-	"github.com/dashevo/dashd-go/btcjson"
 	"net"
 	"os"
 	"os/signal"
 	"time"
+
+	"github.com/dashevo/dashd-go/btcjson"
 
 	"github.com/tendermint/tendermint/crypto"
 
@@ -238,7 +239,7 @@ func (th *TestHarness) TestSignProposal() error {
 	}
 	p := prop.ToProto()
 	propSignId := types.ProposalBlockSignId(th.chainID, p, btcjson.LLMQType_5_60, th.quorumHash)
-	if err := th.signerClient.SignProposal(th.chainID, btcjson.LLMQType_5_60, th.quorumHash, p); err != nil {
+	if _, err := th.signerClient.SignProposal(th.chainID, btcjson.LLMQType_5_60, th.quorumHash, p); err != nil {
 		th.logger.Error("FAILED: Signing of proposal", "err", err)
 		return newTestHarnessError(ErrTestSignProposalFailed, err, "")
 	}

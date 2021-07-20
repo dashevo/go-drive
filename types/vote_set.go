@@ -80,11 +80,14 @@ type VoteSet struct {
 	peerMaj23s        map[P2PID]BlockID      // Maj23 for each peer
 }
 
-// Constructs a new VoteSet struct used to accumulate votes for given height/round.
+// NewVoteSet constructs a new VoteSet struct used to accumulate votes for given height/round.
 func NewVoteSet(chainID string, height int64, round int32,
 	signedMsgType tmproto.SignedMsgType, valSet *ValidatorSet) *VoteSet {
 	if height == 0 {
 		panic("Cannot make VoteSet for height == 0, doesn't make sense.")
+	}
+	if !valSet.HasPublicKeys {
+		panic("Cannot make VoteSet when the validator set doesn't have public keys.")
 	}
 	return &VoteSet{
 		chainID:       chainID,
@@ -637,6 +640,9 @@ func (voteSet *VoteSet) LogString() string {
 
 // return the power voted, the total, and the fraction
 func (voteSet *VoteSet) sumTotalFrac() (int64, int64, float64) {
+	if voteSet.valSet == nil {
+		panic("vote set validator set should be set")
+	}
 	voted, total := voteSet.sum, voteSet.valSet.TotalVotingPower()
 	fracVoted := float64(voted) / float64(total)
 	return voted, total, fracVoted
@@ -674,25 +680,7 @@ func (voteSet *VoteSet) MakeCommit() *Commit {
 		panic("Cannot MakeCommit() unless a thresholdStateSig has been created")
 	}
 
-	// For every validator, get the precommit
-	commitSigs := make([]CommitSig, len(voteSet.votes))
-	for i, v := range voteSet.votes {
-		if v != nil {
-			err := v.ValidateBasic()
-			if err != nil {
-				panic(err)
-			}
-		}
-		commitSig := v.CommitSig()
-		// if block ID exists but doesn't match, exclude sig
-		if commitSig.ForBlock() && !v.BlockID.Equals(*voteSet.maj23) {
-			commitSig = NewCommitSigAbsent()
-		}
-		commitSigs[i] = commitSig
-	}
-
-	return NewCommit(voteSet.GetHeight(), voteSet.GetRound(), *voteSet.maj23, *voteSet.stateMaj23,
-		commitSigs, voteSet.valSet.QuorumHash, voteSet.thresholdBlockSig, voteSet.thresholdStateSig)
+	return NewCommit(voteSet.GetHeight(), voteSet.GetRound(), *voteSet.maj23, *voteSet.stateMaj23, voteSet.valSet.QuorumHash, voteSet.thresholdBlockSig, voteSet.thresholdStateSig)
 }
 
 //--------------------------------------------------------------------------------

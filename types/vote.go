@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+
 	"github.com/dashevo/dashd-go/btcjson"
 	"github.com/tendermint/tendermint/crypto/bls12381"
 
@@ -79,30 +80,6 @@ type Vote struct {
 	StateSignature     []byte                `json:"state_signature"`
 }
 
-// CommitSig converts the Vote to a CommitSig.
-func (vote *Vote) CommitSig() CommitSig {
-	if vote == nil {
-		return NewCommitSigAbsent()
-	}
-
-	var blockIDFlag BlockIDFlag
-	switch {
-	case vote.BlockID.IsComplete():
-		blockIDFlag = BlockIDFlagCommit
-	case vote.BlockID.IsZero():
-		blockIDFlag = BlockIDFlagNil
-	default:
-		panic(fmt.Sprintf("Invalid vote %v - expected BlockID to be either empty or complete", vote))
-	}
-
-	return CommitSig{
-		BlockIDFlag:        blockIDFlag,
-		ValidatorProTxHash: vote.ValidatorProTxHash,
-		BlockSignature:     vote.BlockSignature,
-		StateSignature:     vote.StateSignature,
-	}
-}
-
 // VoteBlockSignBytes returns the proto-encoding of the canonicalized Vote, for
 // signing. Panics is the marshaling fails.
 //
@@ -121,7 +98,7 @@ func VoteBlockSignBytes(chainID string, vote *tmproto.Vote) []byte {
 	return bz
 }
 
-// VoteBlockSignId returns signId that should be signed for the block
+// VoteBlockSignId returns signID that should be signed for the block
 func VoteBlockSignId(chainID string, vote *tmproto.Vote, quorumType btcjson.LLMQType, quorumHash []byte) []byte {
 	blockSignBytes := VoteBlockSignBytes(chainID, vote)
 
@@ -129,30 +106,20 @@ func VoteBlockSignId(chainID string, vote *tmproto.Vote, quorumType btcjson.LLMQ
 
 	blockRequestId := VoteBlockRequestIdProto(vote)
 
-	blockSignId := crypto.SignId(quorumType, bls12381.ReverseBytes(quorumHash), bls12381.ReverseBytes(blockRequestId), bls12381.ReverseBytes(blockMessageHash))
+	blockSignID := crypto.SignId(quorumType, bls12381.ReverseBytes(quorumHash), bls12381.ReverseBytes(blockRequestId), bls12381.ReverseBytes(blockMessageHash))
 
-	return blockSignId
+	return blockSignID
 }
 
-// VoteStateSignBytes returns the proto-encoding of the canonicalized last app hash state, for
-// signing. Panics is the marshaling fails.
-//
-// The encoded Protobuf message is varint length-prefixed (using MarshalDelimited)
-// for backwards-compatibility with the Amino encoding, due to e.g. hardware
-// devices that rely on this encoding.
-//
-// See CanonicalizeVote
+// VoteStateSignBytes returns the 40 bytes of the height + last state app hash.
 func VoteStateSignBytes(chainID string, vote *tmproto.Vote) []byte {
-	pb := CanonicalizeStateVote(vote)
-	bz, err := protoio.MarshalDelimited(&pb)
-	if err != nil {
-		panic(err)
-	}
-
+	bz := make([]byte, 8)
+	binary.LittleEndian.PutUint64(bz, uint64(vote.Height - 1))
+	bz = append(bz, vote.StateID.LastAppHash...)
 	return bz
 }
 
-// VoteStateSignId returns signId that should be signed for the state
+// VoteStateSignId returns signID that should be signed for the state
 func VoteStateSignId(chainID string, vote *tmproto.Vote, quorumType btcjson.LLMQType, quorumHash []byte) []byte {
 	stateSignBytes := VoteStateSignBytes(chainID, vote)
 
@@ -243,12 +210,10 @@ func VoteBlockRequestIdProto(vote *tmproto.Vote) []byte {
 func VoteStateRequestId(vote *Vote) []byte {
 	requestIdMessage := []byte("dpsvote")
 	heightByteArray := make([]byte, 8)
-	binary.LittleEndian.PutUint64(heightByteArray, uint64(vote.Height))
-	roundByteArray := make([]byte, 4)
-	binary.LittleEndian.PutUint32(roundByteArray, uint32(vote.Round))
+	// We use height - 1 because we are signing the state at the end of the execution of the previous block
+	binary.LittleEndian.PutUint64(heightByteArray, uint64(vote.Height) - 1)
 
 	requestIdMessage = append(requestIdMessage, heightByteArray...)
-	requestIdMessage = append(requestIdMessage, roundByteArray...)
 
 	return crypto.Sha256(requestIdMessage)
 }
@@ -256,12 +221,9 @@ func VoteStateRequestId(vote *Vote) []byte {
 func VoteStateRequestIdProto(vote *tmproto.Vote) []byte {
 	requestIdMessage := []byte("dpsvote")
 	heightByteArray := make([]byte, 8)
-	binary.LittleEndian.PutUint64(heightByteArray, uint64(vote.Height))
-	roundByteArray := make([]byte, 4)
-	binary.LittleEndian.PutUint32(roundByteArray, uint32(vote.Round))
+	binary.LittleEndian.PutUint64(heightByteArray, uint64(vote.Height) - 1)
 
 	requestIdMessage = append(requestIdMessage, heightByteArray...)
-	requestIdMessage = append(requestIdMessage, roundByteArray...)
 
 	return crypto.Sha256(requestIdMessage)
 }
@@ -280,12 +242,12 @@ func (vote *Vote) Verify(chainID string, quorumType btcjson.LLMQType, quorumHash
 
 	blockRequestId := VoteBlockRequestId(vote)
 
-	signId := crypto.SignId(quorumType, bls12381.ReverseBytes(quorumHash), bls12381.ReverseBytes(blockRequestId), bls12381.ReverseBytes(blockMessageHash))
+	signID := crypto.SignId(quorumType, bls12381.ReverseBytes(quorumHash), bls12381.ReverseBytes(blockRequestId), bls12381.ReverseBytes(blockMessageHash))
 
-	// fmt.Printf("block vote verify sign Id %s (%d - %s  - %s  - %s)\n", hex.EncodeToString(signId), quorumType,
+	// fmt.Printf("block vote verify sign Id %s (%d - %s  - %s  - %s)\n", hex.EncodeToString(signID), quorumType,
 	//	hex.EncodeToString(quorumHash), hex.EncodeToString(blockRequestId), hex.EncodeToString(blockMessageHash))
 
-	if !pubKey.VerifySignatureDigest(signId, vote.BlockSignature) {
+	if !pubKey.VerifySignatureDigest(signID, vote.BlockSignature) {
 		return fmt.Errorf("%s proTxHash %s pubKey %v vote %v sign bytes %s block signature %s", ErrVoteInvalidBlockSignature.Error(),
 			proTxHash, pubKey, vote, hex.EncodeToString(voteBlockSignBytes), hex.EncodeToString(vote.BlockSignature))
 	}
@@ -354,16 +316,16 @@ func (vote *Vote) ValidateBasic() error {
 		return errors.New("block signature is missing")
 	}
 
-	if len(vote.BlockSignature) > MaxSignatureSize {
-		return fmt.Errorf("block signature is too big (max: %d)", MaxSignatureSize)
+	if len(vote.BlockSignature) > SignatureSize {
+		return fmt.Errorf("block signature is too big (max: %d)", SignatureSize)
 	}
 
 	if vote.BlockID.Hash != nil && len(vote.StateSignature) == 0 {
 		return errors.New("state signature is missing for a block not voting nil")
 	}
 
-	if len(vote.StateSignature) > MaxSignatureSize {
-		return fmt.Errorf("state signature is too big (max: %d)", MaxSignatureSize)
+	if len(vote.StateSignature) > SignatureSize {
+		return fmt.Errorf("state signature is too big (max: %d)", SignatureSize)
 	}
 
 	return nil

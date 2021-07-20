@@ -4,11 +4,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
+	"time"
+
 	"github.com/dashevo/dashd-go/btcjson"
 	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/crypto/bls12381"
-	"math"
-	"time"
 
 	tmbytes "github.com/tendermint/tendermint/libs/bytes"
 	"github.com/tendermint/tendermint/libs/protoio"
@@ -83,8 +84,8 @@ func (p *Proposal) ValidateBasic() error {
 		return errors.New("signature is missing")
 	}
 
-	if len(p.Signature) > MaxSignatureSize {
-		return fmt.Errorf("signature is too big (max: %d)", MaxSignatureSize)
+	if len(p.Signature) > SignatureSize {
+		return fmt.Errorf("signature is too big (max: %d)", SignatureSize)
 	}
 	return nil
 }
@@ -100,6 +101,9 @@ func (p *Proposal) ValidateBasic() error {
 //
 // See BlockID#String.
 func (p *Proposal) String() string {
+	if p == nil {
+		return fmt.Sprintf("Proposal{nil}")
+	}
 	return fmt.Sprintf("Proposal{%v/%v (%v, %v) %X @ %s}",
 		p.Height,
 		p.Round,
@@ -109,7 +113,7 @@ func (p *Proposal) String() string {
 		CanonicalTime(p.Timestamp))
 }
 
-// ProposalSignBytes returns the proto-encoding of the canonicalized Proposal,
+// ProposalBlockSignBytes returns the proto-encoding of the canonicalized Proposal,
 // for signing. Panics if the marshaling fails.
 //
 // The encoded Protobuf message is varint length-prefixed (using MarshalDelimited)
@@ -133,9 +137,9 @@ func ProposalBlockSignId(chainID string, p *tmproto.Proposal, quorumType btcjson
 
 	proposalRequestId := ProposalRequestIdProto(p)
 
-	signId := crypto.SignId(quorumType, bls12381.ReverseBytes(quorumHash), bls12381.ReverseBytes(proposalRequestId), bls12381.ReverseBytes(proposalMessageHash))
+	signID := crypto.SignId(quorumType, bls12381.ReverseBytes(quorumHash), bls12381.ReverseBytes(proposalRequestId), bls12381.ReverseBytes(proposalMessageHash))
 
-	return signId
+	return signID
 }
 
 func ProposalRequestId(p *Proposal) []byte {

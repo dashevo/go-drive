@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"testing"
 
+	dashcore "github.com/tendermint/tendermint/dashcore/rpc"
+
 	"github.com/dashevo/dashd-go/btcjson"
 	"github.com/stretchr/testify/assert"
 	"github.com/tendermint/tendermint/crypto"
@@ -70,12 +72,14 @@ func TestDashCoreSignerPingMethod(t *testing.T) {
 	go func() {
 		srv.Start()
 	}()
+	cs := &StaticCoreServer{}
 	srv = WithMethods(
 		srv,
-		WithPingMethod(1),
-		WithGetPeerInfoMethod(1),
+		WithPingMethod(cs, 1),
 	)
-	client, err := privval.NewDashCoreSignerClient(addr, "root", "root", btcjson.LLMQType_5_60, "chain-123456")
+	dashCoreRpcClient, err := dashcore.NewDashCoreRpcClient(addr, "root", "root")
+	assert.NoError(t, err)
+	client, err := privval.NewDashCoreSignerClient(dashCoreRpcClient, btcjson.LLMQType_5_60)
 	assert.NoError(t, err)
 	err = client.Ping()
 	assert.NoError(t, err)
@@ -118,7 +122,10 @@ func TestGetPubKey(t *testing.T) {
 		WithMasternodeMethod(cs, Endless),
 		WithGetNetworkInfoMethod(cs, Endless),
 	)
-	client, err := privval.NewDashCoreSignerClient(addr, "root", "root", btcjson.LLMQType_5_60, "chain-123456")
+
+	dashCoreRpcClient, err := dashcore.NewDashCoreRpcClient(addr, "root", "root")
+	assert.NoError(t, err)
+	client, err := privval.NewDashCoreSignerClient(dashCoreRpcClient, btcjson.LLMQType_5_60)
 	assert.NoError(t, err)
 	quorumHash := crypto.RandQuorumHash()
 	pubKey, err := client.GetPubKey(quorumHash)
